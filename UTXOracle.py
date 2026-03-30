@@ -230,9 +230,76 @@ import http.client
 import json
 import base64
 
+import urllib.request
+import time as _time
+
+# Public API fallback — used when local RPC is unreachable
+# Both use Esplora API format. mempool.space first, Blockstream as backup.
+_FALLBACK_APIS = [
+    "https://mempool.space/api",
+    "https://blockstream.info/api",
+]
+_use_public_api = False  # set True after first RPC failure
+
+def _public_api_fetch(path, timeout=15):
+    """Fetch from public APIs with failover and retry on 429."""
+    last_err = None
+    for api_base in _FALLBACK_APIS:
+        url = f"{api_base}{path}"
+        for attempt in range(3):
+            try:
+                return urllib.request.urlopen(url, timeout=timeout).read()
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    _time.sleep(2 ** attempt)
+                    continue
+                last_err = e
+                break  # try next API
+            except Exception as e:
+                last_err = e
+                break  # try next API
+    raise Exception(f"All public APIs failed for {path}: {last_err}")
+
+def _ask_public_api(method, params):
+    """Translate Bitcoin RPC calls to Esplora REST API.
+    Returns bytes to match Ask_Node's interface."""
+    if method == "getblockcount":
+        return _public_api_fetch("/blocks/tip/height").strip()
+    elif method == "getblockhash":
+        height = params[0]
+        return _public_api_fetch(f"/block-height/{height}").strip()
+    elif method == "getblockheader":
+        block_hash = params[0]
+        data = _public_api_fetch(f"/block/{block_hash}")
+        block = json.loads(data)
+        header = {
+            "hash": block["id"],
+            "height": block["height"],
+            "time": block["timestamp"],
+            "mediantime": block["mediantime"],
+            "nTx": block["tx_count"],
+            "previousblockhash": block["previousblockhash"],
+        }
+        return json.dumps(header, indent=2).encode()
+    elif method == "getblock":
+        block_hash = params[0]
+        verbosity = params[1] if len(params) > 1 else 1
+        if verbosity == 0:
+            raw = _public_api_fetch(f"/block/{block_hash}/raw", timeout=60)
+            return raw.hex().encode()
+        else:
+            return _public_api_fetch(f"/block/{block_hash}")
+    else:
+        raise Exception(f"Public API fallback: unsupported method '{method}'")
+
 def Ask_Node(command, cred_creation):
+    global _use_public_api
     method = command[0]
     params = command[1:]
+
+    # If we've already failed RPC, go straight to public API
+    if _use_public_api:
+        return _ask_public_api(method, params)
 
     # Handle authentication
     rpc_u = rpc_user
@@ -257,14 +324,15 @@ def Ask_Node(command, cred_creation):
     })
 
     # Basic auth header
-    auth_header = base64.b64encode(f"{rpc_u}:{rpc_p}".encode()).decode()
+    _cred_str = f"{rpc_u}:{rpc_p}"
+    auth_header = base64.b64encode(_cred_str.encode()).decode()
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Basic {auth_header}"
     }
 
     try:
-        conn = http.client.HTTPConnection(rpc_host, rpc_port)
+        conn = http.client.HTTPConnection(rpc_host, rpc_port, timeout=10)
         conn.request("POST", "/", payload, headers)
         response = conn.getresponse()
         if response.status != 200:
@@ -283,15 +351,10 @@ def Ask_Node(command, cred_creation):
             return str(result).encode()
 
     except Exception as e:
-        if not cred_creation:
-            print("Error connecting to your node via RPC. Troubleshooting steps:\n")
-            print("\t1) Ensure bitcoind or bitcoin-qt is running with server=1.")
-            print("\t2) Check rpcuser/rpcpassword or .cookie.")
-            print("\t3) Verify RPC port/host settings.")
-            print("\nThe attempted RPC method was:", method)
-            print("Parameters:", params)
-            print("\nThe error was:\n", e)
-            sys.exit(1)
+        print(f"\nRPC failed ({method}): {e}")
+        print("Falling back to public API (mempool.space/blockstream)...")
+        _use_public_api = True
+        return _ask_public_api(method, params)
 
 
 #get current block height from local node and exit if connection not made
@@ -456,23 +519,26 @@ if block_mode:
     block_finish_num = block_count
     block_start_num = block_finish_num - 144
     
-    #append needed block nums and hashes needed
-    block_num = block_start_num
-    time_in_seconds, hash_end = get_block_time(block_start_num)
-    print_every = 0
-    while block_num < block_finish_num:
-        
-        #print update
-        if (block_num-block_start_num)/144*100 > print_every and print_every < 100:
-            print(str(print_every)+"%..",end="",flush=True)
-            print_every += 20
-        block_nums_needed.append(block_num)
+    # Fetch all block headers in parallel
+    from concurrent.futures import ThreadPoolExecutor
+    _header_workers = 8 if _use_public_api else 4
+    _heights = list(range(block_start_num, block_finish_num))
+    
+    def _get_block_info(height):
+        return height, get_block_time(height)
+    
+    _results = {}
+    with ThreadPoolExecutor(max_workers=_header_workers) as _pool:
+        for height, (t, h) in _pool.map(_get_block_info, _heights):
+            _results[height] = (t, h)
+    
+    for height in _heights:
+        time_in_seconds, hash_end = _results[height]
+        block_nums_needed.append(height)
         block_hashes_needed.append(hash_end)
         block_times_needed.append(time_in_seconds)
-        block_num += 1
-        time_in_seconds, hash_end = get_block_time(block_num)
-        
-    print("100%\t\t\t25% done",flush=True)
+    
+    print("0%..20%..40%..60%..80%..100%\t\t\t25% done",flush=True)
 
 #if date mode search for all the blocks on this day
 elif date_mode:
@@ -773,19 +839,71 @@ def compute_txid(raw_tx_bytes: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(stripped_tx).digest()).digest()[::-1]
 
 
-# read in all blocks needed
+# Prefetch all raw blocks in parallel for speed, with disk cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib as _hashlib
+
+_block_cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".block_cache")
+os.makedirs(_block_cache_dir, exist_ok=True)
+
+def _cache_path(bh):
+    return os.path.join(_block_cache_dir, bh[:16])
+
+def _fetch_raw_block(bh):
+    # Check disk cache first
+    cp = _cache_path(bh)
+    if os.path.exists(cp):
+        with open(cp, "r") as f:
+            return bh, f.read()
+    raw_hex = Ask_Node(["getblock", bh, 0], False).decode().strip()
+    # Cache to disk (blocks are immutable)
+    try:
+        with open(cp, "w") as f:
+            f.write(raw_hex)
+    except Exception:
+        pass
+    return bh, raw_hex
+
+_prefetch_workers = 4 if _use_public_api else 1  # parallel only for public APIs (node RPC is single-threaded)
+
+# Count cache hits
+_cache_hits = sum(1 for bh in block_hashes_needed if os.path.exists(_cache_path(bh)))
+_to_fetch = len(block_hashes_needed) - _cache_hits
+print(f"\nPrefetching {len(block_hashes_needed)} blocks ({_cache_hits} cached, {_to_fetch} to fetch, {_prefetch_workers} workers)...",flush=True)
+
+_prefetched_blocks = {}
+_prefetch_done = 0
+with ThreadPoolExecutor(max_workers=_prefetch_workers) as _pool:
+    _futures = {_pool.submit(_fetch_raw_block, bh): bh for bh in block_hashes_needed}
+    for _f in as_completed(_futures):
+        bh, raw_hex = _f.result()
+        _prefetched_blocks[bh] = raw_hex
+        _prefetch_done += 1
+        _pct = int(_prefetch_done / len(block_hashes_needed) * 100)
+        if _pct % 10 == 0:
+            print(f"{_pct}%..",end="",flush=True)
+print("done",flush=True)
+
+# Clean old cache entries (keep last 300 blocks worth)
+try:
+    _cached_files = sorted(os.listdir(_block_cache_dir), key=lambda f: os.path.getmtime(os.path.join(_block_cache_dir, f)))
+    if len(_cached_files) > 300:
+        for _old in _cached_files[:len(_cached_files)-300]:
+            os.remove(os.path.join(_block_cache_dir, _old))
+except Exception:
+    pass
+
+# Process all prefetched blocks
 for bh in block_hashes_needed:
     block_num += 1
     print_progress = block_num / len(block_hashes_needed) * 100
     if print_progress > print_next and print_next < 100:
-        #print(f"{int(print_next)}% ", end="", flush=True)
         print(f"{int(print_next)}%..",end="",flush=True)
         print_next += 1
         if print_next % 7 == 0:
             print("\n", end="")
 
-    # Get raw block hex using RPC
-    raw_block_hex = Ask_Node(["getblock", bh, 0], False).decode().strip()
+    raw_block_hex = _prefetched_blocks[bh]
     raw_block_bytes = binascii.unhexlify(raw_block_hex)
     stream = BytesIO(raw_block_bytes)
 

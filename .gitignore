@@ -1,0 +1,6 @@
+.block_cache/
+__pycache__/
+*.pyc
+bitcoin.conf
+.cookie
+*.html
